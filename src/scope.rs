@@ -33,6 +33,7 @@ pub(crate) struct ScopeRecord {
     pub(crate) children: std::collections::HashSet<ScopeId>,
     pub(crate) fibers: std::collections::HashSet<u64>,
     pub(crate) owner: Arc<ResourceOwner>,
+    pub(crate) resources_started: bool,
     pub(crate) close_notify: Arc<Notify>,
     pub(crate) close_error: Option<String>,
 }
@@ -45,6 +46,7 @@ impl ScopeRecord {
             children: std::collections::HashSet::new(),
             fibers: std::collections::HashSet::new(),
             owner: ResourceOwner::new(),
+            resources_started: false,
             close_notify: Arc::new(Notify::new()),
             close_error: None,
         }

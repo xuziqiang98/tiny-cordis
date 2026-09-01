@@ -68,28 +68,24 @@ impl Context {
             OwnerId::Scope(scope) => self.coordinator.provide_scope(scope, key, erased),
             OwnerId::Activation(_) => {
                 let activation = self.activation.as_ref().ok_or(KernelError::ScopeClosed)?;
-                activation.owner.ensure_open()?;
-                let mut staged = activation
-                    .staged
-                    .lock()
-                    .map_err(|_| KernelError::Internal("activation lock poisoned".into()))?;
-                if staged.contains_key(&key.id) {
-                    return Err(KernelError::DuplicateService {
-                        service: key.id.type_id(),
-                        name: key.name,
-                    });
-                }
-                if self
-                    .coordinator
-                    .has_local_binding(self.visible_scope, key.id)
-                {
-                    return Err(KernelError::DuplicateService {
-                        service: key.id.type_id(),
-                        name: key.name,
-                    });
-                }
-                staged.insert(key.id, crate::fiber::StagedService { key, value: erased });
-                Ok(())
+                activation.owner.with_open_registration(|| {
+                    let mut staged = activation
+                        .staged
+                        .lock()
+                        .map_err(|_| KernelError::Internal("activation lock poisoned".into()))?;
+                    if staged.contains_key(&key.id)
+                        || self
+                            .coordinator
+                            .has_local_binding(self.visible_scope, key.id)
+                    {
+                        return Err(KernelError::DuplicateService {
+                            service: key.id.type_id(),
+                            name: key.name,
+                        });
+                    }
+                    staged.insert(key.id, crate::fiber::StagedService { key, value: erased });
+                    Ok(())
+                })
             }
         }
     }

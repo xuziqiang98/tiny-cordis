@@ -64,23 +64,21 @@ impl ResourceOwner {
         })
     }
 
-    pub(crate) fn status(&self) -> OwnerStatus {
-        self.status
+    pub(crate) fn with_open_registration<R>(
+        &self,
+        register: impl FnOnce() -> Result<R, KernelError>,
+    ) -> Result<R, KernelError> {
+        let status = self
+            .status
             .lock()
-            .map(|status| *status)
-            .unwrap_or(OwnerStatus::Closed)
-    }
-
-    pub(crate) fn ensure_open(&self) -> Result<(), KernelError> {
-        if self.status() == OwnerStatus::Open {
-            Ok(())
-        } else {
-            Err(KernelError::ScopeClosed)
+            .map_err(|_| KernelError::Internal("resource owner lock poisoned".into()))?;
+        if *status != OwnerStatus::Open {
+            return Err(KernelError::ScopeClosed);
         }
+        register()
     }
 
-    pub(crate) fn add_child_scope(&self, id: u64) -> Result<(), KernelError> {
-        self.ensure_open()?;
+    pub(crate) fn push_child_scope(&self, id: u64) -> Result<(), KernelError> {
         self.child_scopes
             .lock()
             .map_err(|_| KernelError::Internal("resource owner lock poisoned".into()))?
@@ -88,8 +86,7 @@ impl ResourceOwner {
         Ok(())
     }
 
-    pub(crate) fn add_child_fiber(&self, id: u64) -> Result<(), KernelError> {
-        self.ensure_open()?;
+    pub(crate) fn push_child_fiber(&self, id: u64) -> Result<(), KernelError> {
         self.child_fibers
             .lock()
             .map_err(|_| KernelError::Internal("resource owner lock poisoned".into()))?
@@ -97,19 +94,40 @@ impl ResourceOwner {
         Ok(())
     }
 
+    pub(crate) fn remove_child_scope(&self, id: u64) {
+        if let Ok(mut scopes) = self.child_scopes.lock() {
+            scopes.retain(|child| *child != id);
+        }
+    }
+
+    pub(crate) fn remove_child_fiber(&self, id: u64) {
+        if let Ok(mut fibers) = self.child_fibers.lock() {
+            fibers.retain(|fiber| *fiber != id);
+        }
+    }
+
     pub(crate) fn spawn<F>(self: &Arc<Self>, id: u64, future: F) -> Result<TaskHandle, KernelError>
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        self.ensure_open()?;
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|_| KernelError::Internal("ctx.spawn requires a Tokio runtime".into()))?;
         let owner = Arc::clone(self);
         let task = Arc::new(TaskInner {
             handle: Mutex::new(None),
         });
         let task_for_future = Arc::clone(&task);
-        let join = tokio::runtime::Handle::try_current()
-            .map_err(|_| KernelError::Internal("ctx.spawn requires a Tokio runtime".into()))?
-            .spawn(async move {
+        self.with_open_registration(|| {
+            let mut tasks = self
+                .tasks
+                .lock()
+                .map_err(|_| KernelError::Internal("resource owner lock poisoned".into()))?;
+            let mut handle = task
+                .handle
+                .lock()
+                .map_err(|_| KernelError::Internal("task lock poisoned".into()))?;
+            tasks.insert(id, Arc::clone(&task));
+            let join = runtime.spawn(async move {
                 future.await;
                 if let Ok(mut tasks) = owner.tasks.lock() {
                     tasks.remove(&id);
@@ -118,15 +136,10 @@ impl ResourceOwner {
                     handle.take();
                 }
             });
-        *task
-            .handle
-            .lock()
-            .map_err(|_| KernelError::Internal("task lock poisoned".into()))? = Some(join);
-        self.tasks
-            .lock()
-            .map_err(|_| KernelError::Internal("resource owner lock poisoned".into()))?
-            .insert(id, Arc::clone(&task));
-        Ok(TaskHandle { inner: task })
+            *handle = Some(join);
+            drop(handle);
+            Ok(TaskHandle { inner: task })
+        })
     }
 
     pub(crate) fn defer<F, Fut>(&self, cleanup: F) -> Result<(), KernelError>
@@ -134,12 +147,13 @@ impl ResourceOwner {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
     {
-        self.ensure_open()?;
-        self.cleanups
-            .lock()
-            .map_err(|_| KernelError::Internal("resource owner lock poisoned".into()))?
-            .push(Box::new(move || Box::pin(cleanup())));
-        Ok(())
+        self.with_open_registration(|| {
+            self.cleanups
+                .lock()
+                .map_err(|_| KernelError::Internal("resource owner lock poisoned".into()))?
+                .push(Box::new(move || Box::pin(cleanup())));
+            Ok(())
+        })
     }
 
     pub(crate) fn take_children(&self) -> (Vec<u64>, Vec<u64>) {

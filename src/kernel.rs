@@ -78,6 +78,12 @@ enum Command {
     Terminate,
 }
 
+enum CommitResult {
+    Committed,
+    Retry,
+    Failed(String),
+}
+
 pub(crate) struct Coordinator {
     pub(crate) state: RwLock<State>,
     tx: mpsc::UnboundedSender<Command>,
@@ -165,39 +171,30 @@ impl Coordinator {
         parent: ScopeId,
         owner: Arc<ResourceOwner>,
     ) -> Result<Scope, KernelError> {
-        owner.ensure_open()?;
         let id = self.alloc();
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| KernelError::Internal("coordinator lock poisoned".into()))?;
-        let parent_record = state
-            .scopes
-            .get_mut(&parent)
-            .ok_or(KernelError::ScopeClosed)?;
-        if parent_record.status != ScopeStatus::Open {
-            return Err(KernelError::ScopeClosed);
-        }
-        parent_record.children.insert(id);
-        state.scopes.insert(id, ScopeRecord::new(Some(parent)));
-        drop(state);
-        if let Err(error) = owner.add_child_scope(id) {
-            let _ = self.remove_scope_record(id, parent);
-            return Err(error);
-        }
-        Ok(Scope::new(Arc::clone(self), id))
-    }
-
-    fn remove_scope_record(&self, id: ScopeId, parent: ScopeId) -> Result<(), KernelError> {
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| KernelError::Internal("coordinator lock poisoned".into()))?;
-        state.scopes.remove(&id);
-        if let Some(parent) = state.scopes.get_mut(&parent) {
-            parent.children.remove(&id);
-        }
-        Ok(())
+        owner.with_open_registration(|| {
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| KernelError::Internal("coordinator lock poisoned".into()))?;
+            let parent_record = state
+                .scopes
+                .get_mut(&parent)
+                .ok_or(KernelError::ScopeClosed)?;
+            if parent_record.status != ScopeStatus::Open {
+                return Err(KernelError::ScopeClosed);
+            }
+            parent_record.children.insert(id);
+            state.scopes.insert(id, ScopeRecord::new(Some(parent)));
+            if let Err(error) = owner.push_child_scope(id) {
+                state.scopes.remove(&id);
+                if let Some(parent_record) = state.scopes.get_mut(&parent) {
+                    parent_record.children.remove(&id);
+                }
+                return Err(error);
+            }
+            Ok(Scope::new(Arc::clone(self), id))
+        })
     }
 
     pub(crate) fn register_fiber<P: Plugin>(
@@ -206,7 +203,6 @@ impl Coordinator {
         owner: Arc<ResourceOwner>,
         plugin: P,
     ) -> Result<FiberHandle, KernelError> {
-        owner.ensure_open()?;
         self.ensure_actor()?;
         let spec = PluginSpec::from(plugin);
         let id = self.alloc();
@@ -228,31 +224,29 @@ impl Coordinator {
                 error: None,
             }),
         });
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| KernelError::Internal("coordinator lock poisoned".into()))?;
-        let scope = state
-            .scopes
-            .get_mut(&parent_scope)
-            .ok_or(KernelError::ScopeClosed)?;
-        if scope.status != ScopeStatus::Open {
-            return Err(KernelError::ScopeClosed);
-        }
-        scope.fibers.insert(id);
-        state.fibers.insert(id, Arc::clone(&fiber));
-        drop(state);
-        if let Err(error) = owner.add_child_fiber(id) {
+        owner.with_open_registration(|| {
             let mut state = self
                 .state
                 .write()
                 .map_err(|_| KernelError::Internal("coordinator lock poisoned".into()))?;
-            state.fibers.remove(&id);
-            if let Some(scope) = state.scopes.get_mut(&parent_scope) {
-                scope.fibers.remove(&id);
+            let scope = state
+                .scopes
+                .get_mut(&parent_scope)
+                .ok_or(KernelError::ScopeClosed)?;
+            if scope.status != ScopeStatus::Open {
+                return Err(KernelError::ScopeClosed);
             }
-            return Err(error);
-        }
+            scope.fibers.insert(id);
+            state.fibers.insert(id, Arc::clone(&fiber));
+            if let Err(error) = owner.push_child_fiber(id) {
+                state.fibers.remove(&id);
+                if let Some(scope) = state.scopes.get_mut(&parent_scope) {
+                    scope.fibers.remove(&id);
+                }
+                return Err(error);
+            }
+            Ok(())
+        })?;
         self.enqueue(Command::Reconcile)?;
         Ok(FiberHandle {
             inner: fiber,
@@ -266,50 +260,41 @@ impl Coordinator {
         key: ServiceKey,
         value: ErasedService,
     ) -> Result<(), KernelError> {
+        let owner = self.scope_owner(scope_id).ok_or(KernelError::ScopeClosed)?;
         let binding_id = self.alloc();
-        let state = self
-            .state
-            .write()
-            .map_err(|_| KernelError::Internal("coordinator lock poisoned".into()))?;
-        let scope = state
-            .scopes
-            .get(&scope_id)
-            .ok_or(KernelError::ScopeClosed)?;
-        if scope.status != ScopeStatus::Open {
-            return Err(KernelError::ScopeClosed);
-        }
-        drop(state);
-        self.ensure_actor()?;
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| KernelError::Internal("coordinator lock poisoned".into()))?;
-        let scope = state
-            .scopes
-            .get(&scope_id)
-            .ok_or(KernelError::ScopeClosed)?;
-        if scope.status != ScopeStatus::Open {
-            return Err(KernelError::ScopeClosed);
-        }
-        let local = state.local_bindings.entry(scope_id).or_default();
-        if local.contains_key(&key.id) {
-            return Err(KernelError::DuplicateService {
-                service: key.id.type_id(),
-                name: key.name,
-            });
-        }
-        local.insert(key.id, binding_id);
-        state.bindings.insert(
-            binding_id,
-            Binding {
-                key,
-                visible_scope: scope_id,
-                value,
-                state: BindingState::Committed,
-            },
-        );
-        drop(state);
-        self.enqueue(Command::Reconcile)
+        owner.with_open_registration(|| {
+            self.ensure_actor()?;
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| KernelError::Internal("coordinator lock poisoned".into()))?;
+            let scope = state
+                .scopes
+                .get(&scope_id)
+                .ok_or(KernelError::ScopeClosed)?;
+            if scope.status != ScopeStatus::Open {
+                return Err(KernelError::ScopeClosed);
+            }
+            let local = state.local_bindings.entry(scope_id).or_default();
+            if local.contains_key(&key.id) {
+                return Err(KernelError::DuplicateService {
+                    service: key.id.type_id(),
+                    name: key.name,
+                });
+            }
+            local.insert(key.id, binding_id);
+            state.bindings.insert(
+                binding_id,
+                Binding {
+                    key,
+                    visible_scope: scope_id,
+                    value,
+                    state: BindingState::Committed,
+                },
+            );
+            drop(state);
+            self.enqueue(Command::Reconcile)
+        })
     }
 
     pub(crate) fn resolve(
@@ -318,34 +303,34 @@ impl Coordinator {
         key: ServiceKey,
         activation: Option<&ActivationInner>,
     ) -> Option<ErasedService> {
-        let state = self.state.read().ok()?;
-        if let Some(activation) = activation {
-            let staged = activation.staged.lock().ok()?;
-            if let Some(service) = staged.get(&key.id) {
-                return Some(Arc::clone(&service.value));
-            }
-            drop(staged);
-            let snapshot = activation
-                .dependency_bindings
+        let (staged_value, snapshot) = if let Some(activation) = activation {
+            let staged_value = activation
+                .staged
                 .lock()
-                .ok()
-                .filter(|snapshot| !snapshot.is_empty())
-                .map(|snapshot| snapshot.clone())
-                .or_else(|| {
-                    activation
-                        .required_bindings
-                        .lock()
-                        .ok()
-                        .map(|snapshot| snapshot.clone())
-                })
-                .unwrap_or_default();
-            for binding_id in snapshot.values() {
-                let Some(binding) = state.bindings.get(binding_id) else {
-                    continue;
-                };
-                if binding.key.id == key.id {
-                    return Some(Arc::clone(&binding.value));
-                }
+                .ok()?
+                .get(&key.id)
+                .map(|service| Arc::clone(&service.value));
+            let dependency_snapshot = activation.dependency_bindings.lock().ok()?.clone();
+            let snapshot = if dependency_snapshot.is_empty() {
+                activation.required_bindings.lock().ok()?.clone()
+            } else {
+                dependency_snapshot
+            };
+            (staged_value, snapshot)
+        } else {
+            (None, HashMap::new())
+        };
+        if staged_value.is_some() {
+            return staged_value;
+        }
+
+        let state = self.state.read().ok()?;
+        for binding_id in snapshot.values() {
+            let Some(binding) = state.bindings.get(binding_id) else {
+                continue;
+            };
+            if binding.key.id == key.id {
+                return Some(Arc::clone(&binding.value));
             }
         }
         let mut current = Some(visible_scope);
@@ -386,49 +371,53 @@ impl Coordinator {
     ) -> impl std::future::Future<Output = Result<(), KernelError>> + Send + 'static {
         let coordinator = Arc::clone(self);
         async move {
-            let already_closed = {
+            let (already_closed, notify, owner) = {
                 let state = coordinator
                     .state
                     .read()
                     .map_err(|_| KernelError::Internal("coordinator lock poisoned".into()))?;
-                state
-                    .scopes
-                    .get(&id)
-                    .ok_or(KernelError::ScopeClosed)?
-                    .status
-                    == ScopeStatus::Closed
+                let scope = state.scopes.get(&id).ok_or(KernelError::ScopeClosed)?;
+                (
+                    scope.status == ScopeStatus::Closed,
+                    Arc::clone(&scope.close_notify),
+                    Arc::clone(&scope.owner),
+                )
             };
             if already_closed {
                 return Ok(());
             }
+            owner.begin_close();
             {
                 let mut state = coordinator
                     .state
                     .write()
                     .map_err(|_| KernelError::Internal("coordinator lock poisoned".into()))?;
-                let scope = state.scopes.get_mut(&id).ok_or(KernelError::ScopeClosed)?;
+                let Some(scope) = state.scopes.get_mut(&id) else {
+                    return Ok(());
+                };
                 if scope.status == ScopeStatus::Open {
                     scope.status = ScopeStatus::Closing;
                 }
             }
             coordinator.enqueue(Command::CloseScope(id))?;
             loop {
-                let (status, notify, error) = {
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let (status, error) = {
                     let state = coordinator
                         .state
                         .read()
                         .map_err(|_| KernelError::Internal("coordinator lock poisoned".into()))?;
-                    let scope = state.scopes.get(&id).ok_or(KernelError::ScopeClosed)?;
-                    (
-                        scope.status,
-                        Arc::clone(&scope.close_notify),
-                        scope.close_error.clone(),
-                    )
+                    let Some(scope) = state.scopes.get(&id) else {
+                        return Ok(());
+                    };
+                    (scope.status, scope.close_error.clone())
                 };
                 if status == ScopeStatus::Closed {
                     return error.map_or(Ok(()), |message| Err(KernelError::Internal(message)));
                 }
-                notify.notified().await;
+                notified.await;
             }
         }
     }
@@ -439,7 +428,6 @@ impl Coordinator {
     ) -> impl std::future::Future<Output = Result<(), KernelError>> + Send + 'static {
         let coordinator = Arc::clone(self);
         async move {
-            coordinator.enqueue(Command::DisposeFiber(id))?;
             let fiber = {
                 let state = coordinator
                     .state
@@ -451,6 +439,7 @@ impl Coordinator {
                     .cloned()
                     .ok_or(KernelError::FiberDisposed)?
             };
+            coordinator.enqueue(Command::DisposeFiber(id))?;
             let mut receiver = fiber.state_tx.subscribe();
             loop {
                 if *receiver.borrow() == FiberState::Disposed {
@@ -537,15 +526,16 @@ impl Coordinator {
         fiber: &Arc<FiberInner>,
         activation: Option<&ActivationInner>,
     ) -> bool {
+        let staged = activation
+            .and_then(|activation| activation.staged.lock().ok())
+            .map(|staged| staged.keys().copied().collect::<HashSet<_>>())
+            .unwrap_or_default();
         let Ok(state) = self.state.read() else {
             return false;
         };
         fiber.spec.dependencies.ids().all(|service| {
             resolve_id_locked(&state, fiber.parent_scope, service).is_some()
-                || activation
-                    .and_then(|a| a.staged.lock().ok())
-                    .map(|staged| staged.contains_key(&service))
-                    .unwrap_or(false)
+                || staged.contains(&service)
         })
     }
 
@@ -680,71 +670,112 @@ impl Coordinator {
                 .map(|life| life.desired == DesiredState::Running)
                 .unwrap_or(false)
             && self.dependencies_ready(&fiber, Some(&activation));
-        if can_commit && self.commit_activation(&fiber, &activation) {
-            let _ = self.enqueue(Command::Reconcile);
-            return;
+        if can_commit {
+            match self.commit_activation(&fiber, &activation) {
+                CommitResult::Committed => {
+                    let _ = self.enqueue(Command::Reconcile);
+                    return;
+                }
+                CommitResult::Retry => {
+                    self.finish_activation(fiber, generation, None);
+                    return;
+                }
+                CommitResult::Failed(message) => {
+                    self.finish_activation(fiber, generation, Some(message));
+                    return;
+                }
+            }
         }
 
-        let failed_message = result.as_ref().err().cloned();
-        if let Ok(mut life) = fiber.life.lock() {
-            if let Some(message) = failed_message {
-                life.error = Some(message);
-                life.failure_pending = true;
-            }
-            if life.desired == DesiredState::Running && result.is_err() {
+        if let Err(message) = result {
+            self.finish_activation(fiber, generation, Some(message));
+        } else {
+            self.finish_activation(fiber, generation, None);
+        }
+    }
+
+    fn finish_activation(
+        self: &Arc<Self>,
+        fiber: Arc<FiberInner>,
+        generation: u64,
+        failure: Option<String>,
+    ) {
+        let activation = {
+            let Ok(mut life) = fiber.life.lock() else {
+                return;
+            };
+            if life.stop_started {
+                None
+            } else {
+                if let Some(message) = failure {
+                    life.error = Some(message);
+                    life.failure_pending = true;
+                }
+                life.stop_started = true;
                 if let Ok(mut state) = fiber.state.lock() {
                     *state = FiberState::Stopping;
                 }
                 fiber.state_tx.send_replace(FiberState::Stopping);
-                life.stop_started = true;
+                life.activation.clone()
             }
+        };
+        if let Some(activation) = activation {
+            activation.owner.begin_close();
+            self.launch_cleanup(fiber, generation);
         }
-        self.launch_cleanup(fiber, generation);
     }
 
     fn commit_activation(
         &self,
         fiber: &Arc<FiberInner>,
         activation: &Arc<ActivationInner>,
-    ) -> bool {
-        let staged = activation
-            .staged
+    ) -> CommitResult {
+        let staged = match activation.staged.lock().map(|staged| {
+            staged
+                .values()
+                .map(|service| (service.key, Arc::clone(&service.value)))
+                .collect::<Vec<_>>()
+        }) {
+            Ok(staged) => staged,
+            Err(_) => return CommitResult::Failed("activation lock poisoned".into()),
+        };
+        let required = match activation
+            .required_bindings
             .lock()
-            .map(|staged| {
-                staged
-                    .values()
-                    .map(|service| (service.key, Arc::clone(&service.value)))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+            .map(|snapshot| snapshot.clone())
+        {
+            Ok(required) => required,
+            Err(_) => return CommitResult::Failed("activation lock poisoned".into()),
+        };
         let mut state = match self.state.write() {
             Ok(state) => state,
-            Err(_) => return false,
+            Err(_) => return CommitResult::Failed("coordinator lock poisoned".into()),
         };
         let Some(scope) = state.scopes.get(&fiber.parent_scope) else {
-            return false;
+            return CommitResult::Failed("parent scope is unavailable".into());
         };
         if scope.status != ScopeStatus::Open {
-            return false;
+            return CommitResult::Retry;
         }
-        if staged.iter().any(|(key, _)| {
+        if let Some((key, _)) = staged.iter().find(|(key, _)| {
             state
                 .local_bindings
                 .get(&fiber.parent_scope)
                 .is_some_and(|local| local.contains_key(&key.id))
         }) {
-            return false;
+            return CommitResult::Failed(
+                KernelError::DuplicateService {
+                    service: key.id.type_id(),
+                    name: key.name,
+                }
+                .to_string(),
+            );
         }
-        let required = activation
-            .required_bindings
-            .lock()
-            .map(|snapshot| snapshot.clone())
-            .unwrap_or_default();
         for service in fiber.spec.dependencies.ids() {
             if resolve_id_locked(&state, fiber.parent_scope, service)
                 != required.get(&service).copied()
             {
-                return false;
+                return CommitResult::Retry;
             }
         }
         let mut ids = Vec::with_capacity(staged.len());
@@ -766,6 +797,7 @@ impl Coordinator {
             );
             ids.push(id);
         }
+        drop(state);
         if let Ok(mut bound_ids) = activation.bound_ids.lock() {
             *bound_ids = ids.clone();
         }
@@ -779,7 +811,7 @@ impl Coordinator {
             *current = FiberState::Active;
         }
         fiber.state_tx.send_replace(FiberState::Active);
-        true
+        CommitResult::Committed
     }
 
     fn request_dispose(self: &Arc<Self>, id: FiberId) {
@@ -827,10 +859,20 @@ impl Coordinator {
                         *state = FiberState::Disposed;
                     }
                     fiber.state_tx.send_replace(FiberState::Disposed);
-                    if let Ok(mut state) = self.state.write()
-                        && let Some(scope) = state.scopes.get_mut(&fiber.parent_scope)
-                    {
-                        scope.fibers.remove(&fiber.id);
+                    let owner = self.state.read().ok().and_then(|state| {
+                        state
+                            .scopes
+                            .get(&fiber.parent_scope)
+                            .map(|scope| Arc::clone(&scope.owner))
+                    });
+                    if let Ok(mut state) = self.state.write() {
+                        if let Some(scope) = state.scopes.get_mut(&fiber.parent_scope) {
+                            scope.fibers.remove(&fiber.id);
+                        }
+                        state.fibers.remove(&fiber.id);
+                    }
+                    if let Some(owner) = owner {
+                        owner.remove_child_fiber(fiber.id);
                     }
                 }
                 return;
@@ -842,6 +884,9 @@ impl Coordinator {
             life.generation = life.generation.saturating_add(1);
             (life.activation.clone(), life.generation)
         };
+        if let Some(activation) = &activation {
+            activation.owner.begin_close();
+        }
 
         let mut dependents = Vec::new();
         if let Some(activation) = &activation {
@@ -1000,20 +1045,27 @@ impl Coordinator {
             life.failure_pending = false;
             (desired, failed)
         };
-        if activation_id != 0
-            && let Ok(mut state) = self.state.write()
-            && let Some(activation) = state.activation_ids.remove(&activation_id)
-        {
+        let activation = if activation_id != 0 {
+            self.state
+                .write()
+                .ok()
+                .and_then(|mut state| state.activation_ids.remove(&activation_id))
+        } else {
+            None
+        };
+        if let Some(activation) = activation {
             let ids = activation
                 .bound_ids
                 .lock()
                 .map(|ids| ids.clone())
                 .unwrap_or_default();
-            for binding_id in ids {
-                if let Some(binding) = state.bindings.remove(&binding_id)
-                    && let Some(local) = state.local_bindings.get_mut(&binding.visible_scope)
-                {
-                    local.remove(&binding.key.id);
+            if let Ok(mut state) = self.state.write() {
+                for binding_id in ids {
+                    if let Some(binding) = state.bindings.remove(&binding_id)
+                        && let Some(local) = state.local_bindings.get_mut(&binding.visible_scope)
+                    {
+                        local.remove(&binding.key.id);
+                    }
                 }
             }
         }
@@ -1035,11 +1087,23 @@ impl Coordinator {
             } else {
                 FiberState::Pending
             });
-        if desired == DesiredState::Disposed
-            && let Ok(mut state) = self.state.write()
-            && let Some(scope) = state.scopes.get_mut(&fiber.parent_scope)
-        {
-            scope.fibers.remove(&fiber.id);
+        if desired == DesiredState::Disposed {
+            let owner = if let Ok(mut state) = self.state.write() {
+                let owner = state
+                    .scopes
+                    .get(&fiber.parent_scope)
+                    .map(|scope| Arc::clone(&scope.owner));
+                if let Some(scope) = state.scopes.get_mut(&fiber.parent_scope) {
+                    scope.fibers.remove(&fiber.id);
+                }
+                state.fibers.remove(&fiber.id);
+                owner
+            } else {
+                None
+            };
+            if let Some(owner) = owner {
+                owner.remove_child_fiber(fiber.id);
+            }
         }
         let mut providers_to_cleanup = Vec::new();
         let others = self
@@ -1075,7 +1139,7 @@ impl Coordinator {
     }
 
     fn request_close_scope(self: &Arc<Self>, id: ScopeId) {
-        let (children, fibers) = {
+        let (children, fibers, owner) = {
             let Ok(mut state) = self.state.write() else {
                 return;
             };
@@ -1090,8 +1154,11 @@ impl Coordinator {
             (
                 scope.children.iter().copied().collect::<Vec<_>>(),
                 scope.fibers.iter().copied().collect::<Vec<_>>(),
+                Arc::clone(&scope.owner),
             )
         };
+        owner.begin_close();
+        let _ = owner.take_children();
         for child in children {
             self.request_close_scope(child);
         }
@@ -1103,39 +1170,49 @@ impl Coordinator {
 
     fn maybe_finish_scope_close(self: &Arc<Self>, id: ScopeId) {
         let owner = {
-            let Ok(state) = self.state.read() else { return };
+            let Ok(mut state) = self.state.write() else {
+                return;
+            };
             let Some(scope) = state.scopes.get(&id) else {
                 return;
             };
-            if scope.status != ScopeStatus::Closing
-                || !scope.children.iter().all(|child| {
-                    state
-                        .scopes
-                        .get(child)
-                        .map(|record| record.status == ScopeStatus::Closed)
-                        .unwrap_or(true)
-                })
-                || !scope.fibers.iter().all(|fiber| {
-                    state
-                        .fibers
-                        .get(fiber)
-                        .map(|value| {
-                            value
-                                .state
-                                .lock()
-                                .map(|state| *state == FiberState::Disposed)
-                                .unwrap_or(true)
-                        })
-                        .unwrap_or(true)
-                })
+            let children = scope.children.iter().copied().collect::<Vec<_>>();
+            let fibers = scope.fibers.iter().copied().collect::<Vec<_>>();
+            let status = scope.status;
+            let resources_started = scope.resources_started;
+            let owner = Arc::clone(&scope.owner);
+            let children_closed = children.iter().all(|child| {
+                state
+                    .scopes
+                    .get(child)
+                    .map(|record| record.status == ScopeStatus::Closed)
+                    .unwrap_or(true)
+            });
+            let fibers_disposed = fibers.iter().all(|fiber| {
+                state
+                    .fibers
+                    .get(fiber)
+                    .map(|value| {
+                        value
+                            .state
+                            .lock()
+                            .map(|state| *state == FiberState::Disposed)
+                            .unwrap_or(true)
+                    })
+                    .unwrap_or(true)
+            });
+            if status != ScopeStatus::Closing
+                || resources_started
+                || !children_closed
+                || !fibers_disposed
             {
                 return;
             }
-            Arc::clone(&scope.owner)
+            if let Some(scope) = state.scopes.get_mut(&id) {
+                scope.resources_started = true;
+            }
+            owner
         };
-        if !owner.begin_close() {
-            return;
-        }
         let coordinator = Arc::clone(self);
         tokio::spawn(async move {
             let errors = match owner.close_resources().await {
@@ -1164,7 +1241,7 @@ impl Coordinator {
             scope.status = ScopeStatus::Closed;
             (Arc::clone(&scope.close_notify), scope.parent)
         };
-        if let Ok(mut state) = self.state.write() {
+        let parent_owner = if let Ok(mut state) = self.state.write() {
             for binding_id in state
                 .local_bindings
                 .remove(&id)
@@ -1176,6 +1253,20 @@ impl Coordinator {
             if let Some(parent) = parent.and_then(|parent| state.scopes.get_mut(&parent)) {
                 parent.children.remove(&id);
             }
+            if parent.is_some() {
+                state.scopes.remove(&id);
+            }
+            parent.and_then(|parent| {
+                state
+                    .scopes
+                    .get(&parent)
+                    .map(|scope| Arc::clone(&scope.owner))
+            })
+        } else {
+            None
+        };
+        if let Some(parent_owner) = parent_owner {
+            parent_owner.remove_child_scope(id);
         }
         notify.notify_waiters();
         if let Some(parent) = parent {
