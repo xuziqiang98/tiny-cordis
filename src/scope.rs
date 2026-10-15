@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
 
@@ -35,7 +35,8 @@ pub(crate) struct ScopeRecord {
     pub(crate) owner: Arc<ResourceOwner>,
     pub(crate) resources_started: bool,
     pub(crate) close_notify: Arc<Notify>,
-    pub(crate) close_error: Option<String>,
+    pub(crate) close_errors: Vec<String>,
+    pub(crate) close_outcome: Arc<Mutex<Option<Vec<String>>>>,
 }
 
 impl ScopeRecord {
@@ -48,7 +49,8 @@ impl ScopeRecord {
             owner: ResourceOwner::new(),
             resources_started: false,
             close_notify: Arc::new(Notify::new()),
-            close_error: None,
+            close_errors: Vec::new(),
+            close_outcome: Arc::new(Mutex::new(None)),
         }
     }
 }

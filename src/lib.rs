@@ -8,6 +8,7 @@ mod plugin;
 mod resource;
 mod scope;
 mod service;
+mod unwind;
 
 pub use context::Context;
 pub use error::{BoxError, KernelError};

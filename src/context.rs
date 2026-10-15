@@ -73,6 +73,9 @@ impl Context {
                         .staged
                         .lock()
                         .map_err(|_| KernelError::Internal("activation lock poisoned".into()))?;
+                    if activation.sealed.load(std::sync::atomic::Ordering::Acquire) {
+                        return Err(KernelError::ActivationSealed);
+                    }
                     if staged.contains_key(&key.id)
                         || self
                             .coordinator

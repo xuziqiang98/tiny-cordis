@@ -9,6 +9,7 @@ pub enum KernelError {
     ServiceNotFound { service: TypeId, name: &'static str },
     DuplicateService { service: TypeId, name: &'static str },
     ScopeClosed,
+    ActivationSealed,
     FiberDisposed,
     PluginFailed { name: String, source: BoxError },
     CleanupFailed { errors: Vec<BoxError> },
@@ -34,6 +35,7 @@ impl Display for KernelError {
                 write!(f, "service {name} is already provided in this scope")
             }
             Self::ScopeClosed => f.write_str("scope is closed"),
+            Self::ActivationSealed => f.write_str("activation is no longer accepting services"),
             Self::FiberDisposed => f.write_str("fiber is disposed"),
             Self::PluginFailed { name, source } => write!(f, "plugin {name} failed: {source}"),
             Self::CleanupFailed { errors } => {

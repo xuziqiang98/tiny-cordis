@@ -160,5 +160,58 @@ async fn closing_scope_rejects_concurrent_registrations() -> Result<(), KernelEr
     Ok(())
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn child_scope_cleanup_errors_are_returned_after_scope_removal() -> Result<(), KernelError> {
+    let kernel = Kernel::new();
+    let child = kernel.root().child()?;
+    child
+        .context()
+        .defer(|| async { Err(std::io::Error::other("child cleanup failed").into()) })?;
+
+    let error = child.close().await.unwrap_err();
+    assert!(matches!(error, KernelError::CleanupFailed { errors } if errors.len() == 1));
+    kernel.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shutdown_reports_descendant_cleanup_errors() -> Result<(), KernelError> {
+    let kernel = Kernel::new();
+    let child = kernel.root().child()?;
+    let grandchild = child.context().child()?;
+    grandchild
+        .context()
+        .defer(|| async { Err(std::io::Error::other("grandchild cleanup failed").into()) })?;
+
+    let error = kernel.shutdown().await.unwrap_err();
+    assert!(matches!(error, KernelError::CleanupFailed { errors } if errors.len() == 1));
+    let error = kernel.shutdown().await.unwrap_err();
+    assert!(matches!(error, KernelError::CleanupFailed { errors } if errors.len() == 1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn panicking_cleanup_is_reported_and_does_not_skip_remaining_cleanups()
+-> Result<(), KernelError> {
+    let kernel = Kernel::new();
+    let ctx = kernel.root();
+    let completed = Arc::new(AtomicUsize::new(0));
+    let completed_before_panic = Arc::clone(&completed);
+    ctx.defer(move || async move {
+        completed_before_panic.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    })?;
+    ctx.defer(|| async {
+        panic!("cleanup exploded");
+        #[allow(unreachable_code)]
+        Ok(())
+    })?;
+
+    let error = kernel.shutdown().await.unwrap_err();
+    assert!(matches!(error, KernelError::CleanupFailed { errors } if errors.len() == 1));
+    assert_eq!(completed.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
 #[allow(dead_code)]
 fn _context_is_send_sync(_: Context) {}

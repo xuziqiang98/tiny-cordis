@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 
 use crate::error::{BoxError, KernelError};
+use crate::unwind::catch_future;
 
 pub(crate) type CleanupFuture =
     Pin<Box<dyn Future<Output = Result<(), BoxError>> + Send + 'static>>;
@@ -209,9 +210,14 @@ impl ResourceOwner {
             .map(|mut list| std::mem::take(&mut *list))
             .unwrap_or_default();
         for cleanup in cleanups.into_iter().rev() {
-            match cleanup().await {
-                Ok(()) => {}
-                Err(error) => errors.push(error),
+            match catch_future(async move { cleanup().await }).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => errors.push(error),
+                Err(message) => {
+                    errors.push(Box::new(std::io::Error::other(format!(
+                        "cleanup panicked: {message}"
+                    ))));
+                }
             }
         }
 

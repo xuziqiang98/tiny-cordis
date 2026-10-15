@@ -115,3 +115,95 @@ async fn apply_failure_cancels_task_and_runs_cleanup_once() -> Result<(), Kernel
     assert_eq!(cleanups.load(std::sync::atomic::Ordering::SeqCst), 1);
     Ok(())
 }
+
+struct PanickingApply(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Plugin for PanickingApply {
+    async fn apply(&self, ctx: Context) -> Result<(), KernelError> {
+        let cleanups = Arc::clone(&self.0);
+        ctx.defer(move || async move {
+            cleanups.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })?;
+        ctx.provide::<u32>(Arc::new(9))?;
+        panic!("plugin exploded");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn apply_panic_fails_fiber_and_rolls_back_resources() -> Result<(), KernelError> {
+    let kernel = Kernel::new();
+    let ctx = kernel.root();
+    let cleanups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fiber = ctx.mount(PanickingApply(Arc::clone(&cleanups)))?;
+
+    let error = tokio::time::timeout(std::time::Duration::from_secs(1), fiber.wait_active())
+        .await
+        .map_err(|_| KernelError::Internal("panicking plugin did not settle".into()))?
+        .unwrap_err();
+    assert!(matches!(error, KernelError::PluginFailed { .. }));
+    assert_eq!(fiber.state(), FiberState::Failed);
+    assert!(ctx.get::<u32>().is_none());
+    assert_eq!(cleanups.load(std::sync::atomic::Ordering::SeqCst), 1);
+    kernel.shutdown().await?;
+    Ok(())
+}
+
+struct CaptureActivationContext(Arc<Mutex<Option<Context>>>);
+
+impl Plugin for CaptureActivationContext {
+    async fn apply(&self, ctx: Context) -> Result<(), KernelError> {
+        *self.0.lock().unwrap() = Some(ctx);
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn activation_context_rejects_service_registration_after_apply() -> Result<(), KernelError> {
+    let kernel = Kernel::new();
+    let root = kernel.root();
+    let captured = Arc::new(Mutex::new(None));
+    let fiber = root.mount(CaptureActivationContext(Arc::clone(&captured)))?;
+    fiber.wait_active().await?;
+
+    let context = captured.lock().unwrap().clone().unwrap();
+    assert!(matches!(
+        context.provide::<u64>(Arc::new(5)),
+        Err(KernelError::ActivationSealed)
+    ));
+    assert!(root.get::<u64>().is_none());
+    kernel.shutdown().await?;
+    Ok(())
+}
+
+struct CleanupFailure;
+
+impl Plugin for CleanupFailure {
+    async fn apply(&self, ctx: Context) -> Result<(), KernelError> {
+        ctx.defer(|| async { Err(std::io::Error::other("plugin cleanup failed").into()) })?;
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shutdown_reports_plugin_cleanup_errors() -> Result<(), KernelError> {
+    let kernel = Kernel::new();
+    let fiber = kernel.root().mount(CleanupFailure)?;
+    fiber.wait_active().await?;
+
+    let error = kernel.shutdown().await.unwrap_err();
+    assert!(matches!(error, KernelError::CleanupFailed { errors } if errors.len() == 1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fiber_dispose_returns_cleanup_errors() -> Result<(), KernelError> {
+    let kernel = Kernel::new();
+    let fiber = kernel.root().mount(CleanupFailure)?;
+    fiber.wait_active().await?;
+
+    let error = fiber.dispose().await.unwrap_err();
+    assert!(matches!(error, KernelError::CleanupFailed { errors } if errors.len() == 1));
+    kernel.shutdown().await?;
+    Ok(())
+}

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::watch;
@@ -34,6 +35,7 @@ pub(crate) struct FiberLife {
     pub(crate) stop_started: bool,
     pub(crate) failure_pending: bool,
     pub(crate) error: Option<String>,
+    pub(crate) cleanup_errors: Vec<String>,
 }
 
 pub(crate) struct FiberInner {
@@ -54,7 +56,15 @@ pub(crate) struct ActivationInner {
     pub(crate) required_bindings: Mutex<HashMap<ServiceId, u64>>,
     pub(crate) dependency_bindings: Mutex<HashMap<ServiceId, u64>>,
     pub(crate) cleanup_started: Mutex<bool>,
+    pub(crate) sealed: std::sync::atomic::AtomicBool,
     pub(crate) apply_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl ActivationInner {
+    pub(crate) fn seal_services(&self) {
+        let _staged = self.staged.lock();
+        self.sealed.store(true, Ordering::Release);
+    }
 }
 
 pub(crate) struct StagedService {

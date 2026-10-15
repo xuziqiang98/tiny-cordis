@@ -12,6 +12,7 @@ use crate::plugin::{Plugin, PluginSpec};
 use crate::resource::ResourceOwner;
 use crate::scope::{Scope, ScopeRecord};
 use crate::service::{ServiceId, ServiceKey};
+use crate::unwind::catch_future;
 
 pub(crate) type ScopeId = u64;
 pub(crate) type FiberId = u64;
@@ -19,6 +20,33 @@ pub(crate) type ActivationId = u64;
 pub(crate) type BindingId = u64;
 pub(crate) type TaskId = u64;
 pub(crate) type ErasedService = Arc<dyn Any + Send + Sync>;
+
+fn close_result(outcome: &Mutex<Option<Vec<String>>>) -> Result<(), KernelError> {
+    let errors = outcome
+        .lock()
+        .map_err(|_| KernelError::Internal("scope close result lock poisoned".into()))?
+        .clone()
+        .unwrap_or_default();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(KernelError::CleanupFailed {
+            errors: errors
+                .into_iter()
+                .map(|message| Box::new(std::io::Error::other(message)) as crate::error::BoxError)
+                .collect(),
+        })
+    }
+}
+
+fn error_messages(error: KernelError) -> Vec<String> {
+    match error {
+        KernelError::CleanupFailed { errors } => {
+            errors.into_iter().map(|error| error.to_string()).collect()
+        }
+        error => vec![error.to_string()],
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ScopeStatus {
@@ -222,6 +250,7 @@ impl Coordinator {
                 stop_started: false,
                 failure_pending: false,
                 error: None,
+                cleanup_errors: Vec::new(),
             }),
         });
         owner.with_open_registration(|| {
@@ -371,7 +400,7 @@ impl Coordinator {
     ) -> impl std::future::Future<Output = Result<(), KernelError>> + Send + 'static {
         let coordinator = Arc::clone(self);
         async move {
-            let (already_closed, notify, owner) = {
+            let (already_closed, notify, owner, outcome) = {
                 let state = coordinator
                     .state
                     .read()
@@ -381,10 +410,11 @@ impl Coordinator {
                     scope.status == ScopeStatus::Closed,
                     Arc::clone(&scope.close_notify),
                     Arc::clone(&scope.owner),
+                    Arc::clone(&scope.close_outcome),
                 )
             };
             if already_closed {
-                return Ok(());
+                return close_result(&outcome);
             }
             owner.begin_close();
             {
@@ -393,7 +423,7 @@ impl Coordinator {
                     .write()
                     .map_err(|_| KernelError::Internal("coordinator lock poisoned".into()))?;
                 let Some(scope) = state.scopes.get_mut(&id) else {
-                    return Ok(());
+                    return close_result(&outcome);
                 };
                 if scope.status == ScopeStatus::Open {
                     scope.status = ScopeStatus::Closing;
@@ -404,18 +434,18 @@ impl Coordinator {
                 let notified = notify.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
-                let (status, error) = {
+                let status = {
                     let state = coordinator
                         .state
                         .read()
                         .map_err(|_| KernelError::Internal("coordinator lock poisoned".into()))?;
                     let Some(scope) = state.scopes.get(&id) else {
-                        return Ok(());
+                        return close_result(&outcome);
                     };
-                    (scope.status, scope.close_error.clone())
+                    scope.status
                 };
                 if status == ScopeStatus::Closed {
-                    return error.map_or(Ok(()), |message| Err(KernelError::Internal(message)));
+                    return close_result(&outcome);
                 }
                 notified.await;
             }
@@ -443,7 +473,22 @@ impl Coordinator {
             let mut receiver = fiber.state_tx.subscribe();
             loop {
                 if *receiver.borrow() == FiberState::Disposed {
-                    let error = fiber.life.lock().ok().and_then(|life| life.error.clone());
+                    let (error, cleanup_errors) = fiber
+                        .life
+                        .lock()
+                        .map(|life| (life.error.clone(), life.cleanup_errors.clone()))
+                        .unwrap_or_default();
+                    if !cleanup_errors.is_empty() {
+                        return Err(KernelError::CleanupFailed {
+                            errors: cleanup_errors
+                                .into_iter()
+                                .map(|message| {
+                                    Box::new(std::io::Error::other(message))
+                                        as crate::error::BoxError
+                                })
+                                .collect(),
+                        });
+                    }
                     return error.map_or(Ok(()), |message| Err(KernelError::Internal(message)));
                 }
                 receiver
@@ -589,6 +634,7 @@ impl Coordinator {
                 required_bindings: Mutex::new(initial_snapshot.clone()),
                 dependency_bindings: Mutex::new(HashMap::new()),
                 cleanup_started: Mutex::new(false),
+                sealed: AtomicBool::new(false),
                 apply_handle: Mutex::new(None),
             });
             life.activation = Some(Arc::clone(&activation));
@@ -617,9 +663,12 @@ impl Coordinator {
         );
         let activation_for_task = Arc::clone(&activation);
         let handle = tokio::spawn(async move {
-            let result = (apply)(context)
-                .await
-                .map_err(|error| format!("{plugin_name}: {error}"));
+            let result = match catch_future(async move { (apply)(context).await }).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(format!("{plugin_name}: {error}")),
+                Err(message) => Err(format!("{plugin_name} panicked: {message}")),
+            };
+            activation_for_task.seal_services();
             let _ = coordinator.enqueue(Command::ApplyFinished {
                 fiber_id: activation_for_task.fiber_id,
                 generation,
@@ -978,19 +1027,20 @@ impl Coordinator {
                 let _ = handle.await;
             }
             let (child_scopes, child_fibers) = activation.owner.take_children();
+            let mut errors = Vec::new();
             for child in child_scopes {
-                let _ = coordinator.close_scope(child).await;
+                if let Err(error) = coordinator.close_scope(child).await {
+                    errors.extend(error_messages(error));
+                }
             }
             for child in child_fibers {
-                let _ = coordinator.dispose_fiber(child).await;
-            }
-            let errors = match activation.owner.close_resources().await {
-                Ok(()) => Vec::new(),
-                Err(KernelError::CleanupFailed { errors }) => {
-                    errors.into_iter().map(|error| error.to_string()).collect()
+                if let Err(error) = coordinator.dispose_fiber(child).await {
+                    errors.extend(error_messages(error));
                 }
-                Err(error) => vec![error.to_string()],
-            };
+            }
+            if let Err(error) = activation.owner.close_resources().await {
+                errors.extend(error_messages(error));
+            }
             let _ = coordinator.enqueue(Command::StopFinished {
                 fiber_id: fiber.id,
                 generation,
@@ -1035,7 +1085,12 @@ impl Coordinator {
                 return;
             }
             if !errors.is_empty() {
-                life.error = Some(errors.join("; "));
+                let cleanup_message = errors.join("; ");
+                life.error = Some(match life.error.take() {
+                    Some(message) => format!("{message}; cleanup failed: {cleanup_message}"),
+                    None => cleanup_message,
+                });
+                life.cleanup_errors.extend(errors.iter().cloned());
             }
             let desired = life.desired;
             let failed = life.failure_pending;
@@ -1045,6 +1100,14 @@ impl Coordinator {
             life.failure_pending = false;
             (desired, failed)
         };
+        if desired == DesiredState::Disposed
+            && !errors.is_empty()
+            && let Ok(mut state) = self.state.write()
+            && let Some(scope) = state.scopes.get_mut(&fiber.parent_scope)
+            && scope.status == ScopeStatus::Closing
+        {
+            scope.close_errors.extend(errors.iter().cloned());
+        }
         let activation = if activation_id != 0 {
             self.state
                 .write()
@@ -1215,13 +1278,12 @@ impl Coordinator {
         };
         let coordinator = Arc::clone(self);
         tokio::spawn(async move {
-            let errors = match owner.close_resources().await {
-                Ok(()) => Vec::new(),
-                Err(KernelError::CleanupFailed { errors }) => {
-                    errors.into_iter().map(|error| error.to_string()).collect()
-                }
-                Err(error) => vec![error.to_string()],
-            };
+            let errors = owner
+                .close_resources()
+                .await
+                .err()
+                .map(error_messages)
+                .unwrap_or_default();
             let _ = coordinator.enqueue(Command::ScopeResourcesFinished {
                 scope_id: id,
                 errors,
@@ -1230,16 +1292,20 @@ impl Coordinator {
     }
 
     fn scope_resources_finished(self: &Arc<Self>, id: ScopeId, errors: Vec<String>) {
-        let (notify, parent) = {
+        let (notify, parent, all_errors) = {
             let Ok(mut state) = self.state.write() else {
                 return;
             };
             let Some(scope) = state.scopes.get_mut(&id) else {
                 return;
             };
-            scope.close_error = (!errors.is_empty()).then(|| errors.join("; "));
+            scope.close_errors.extend(errors);
+            let all_errors = std::mem::take(&mut scope.close_errors);
+            if let Ok(mut outcome) = scope.close_outcome.lock() {
+                *outcome = Some(all_errors.clone());
+            }
             scope.status = ScopeStatus::Closed;
-            (Arc::clone(&scope.close_notify), scope.parent)
+            (Arc::clone(&scope.close_notify), scope.parent, all_errors)
         };
         let parent_owner = if let Ok(mut state) = self.state.write() {
             for binding_id in state
@@ -1250,8 +1316,11 @@ impl Coordinator {
             {
                 state.bindings.remove(&binding_id);
             }
-            if let Some(parent) = parent.and_then(|parent| state.scopes.get_mut(&parent)) {
-                parent.children.remove(&id);
+            if let Some(parent_scope) = parent.and_then(|parent| state.scopes.get_mut(&parent)) {
+                parent_scope.children.remove(&id);
+                if parent_scope.status == ScopeStatus::Closing {
+                    parent_scope.close_errors.extend(all_errors);
+                }
             }
             if parent.is_some() {
                 state.scopes.remove(&id);
