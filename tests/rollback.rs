@@ -1,3 +1,5 @@
+use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
@@ -204,6 +206,63 @@ async fn fiber_dispose_returns_cleanup_errors() -> Result<(), KernelError> {
 
     let error = fiber.dispose().await.unwrap_err();
     assert!(matches!(error, KernelError::CleanupFailed { errors } if errors.len() == 1));
+    kernel.shutdown().await?;
+    Ok(())
+}
+
+struct CountedCleanup {
+    cleanups: Arc<AtomicUsize>,
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl Plugin for CountedCleanup {
+    async fn apply(&self, ctx: Context) -> Result<(), KernelError> {
+        let cleanups = Arc::clone(&self.cleanups);
+        let started = Arc::clone(&self.started);
+        let release = Arc::clone(&self.release);
+        ctx.defer(move || async move {
+            cleanups.fetch_add(1, Ordering::SeqCst);
+            started.notify_one();
+            release.notified().await;
+            Ok(())
+        })?;
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_dispose_runs_cleanup_once() -> Result<(), KernelError> {
+    let kernel = Kernel::new();
+    let cleanups = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let fiber = kernel.root().mount(CountedCleanup {
+        cleanups: Arc::clone(&cleanups),
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+    })?;
+    fiber.wait_active().await?;
+
+    let first = {
+        let fiber = fiber.clone();
+        tokio::spawn(async move { fiber.dispose().await })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+        .await
+        .map_err(|_| KernelError::Internal("cleanup did not start".into()))?;
+    let second = fiber.dispose();
+    tokio::pin!(second);
+    std::future::poll_fn(|cx| {
+        assert!(second.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    release.notify_one();
+
+    first.await.unwrap()?;
+    second.await?;
+    assert_eq!(cleanups.load(Ordering::SeqCst), 1);
     kernel.shutdown().await?;
     Ok(())
 }

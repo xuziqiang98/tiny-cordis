@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::watch;
@@ -29,7 +28,6 @@ pub(crate) enum DesiredState {
 pub(crate) struct FiberLife {
     pub(crate) generation: u64,
     pub(crate) activation: Option<Arc<ActivationInner>>,
-    pub(crate) snapshot: HashMap<ServiceId, u64>,
     pub(crate) desired: DesiredState,
     pub(crate) waiting_dependents: std::collections::HashSet<FiberId>,
     pub(crate) stop_started: bool,
@@ -42,7 +40,6 @@ pub(crate) struct FiberInner {
     pub(crate) id: FiberId,
     pub(crate) parent_scope: ScopeId,
     pub(crate) spec: PluginSpec,
-    pub(crate) state: Mutex<FiberState>,
     pub(crate) state_tx: watch::Sender<FiberState>,
     pub(crate) life: Mutex<FiberLife>,
 }
@@ -51,20 +48,24 @@ pub(crate) struct ActivationInner {
     pub(crate) id: ActivationId,
     pub(crate) fiber_id: FiberId,
     pub(crate) owner: Arc<ResourceOwner>,
-    pub(crate) staged: Mutex<HashMap<ServiceId, StagedService>>,
+    pub(crate) services: Mutex<ActivationServices>,
     pub(crate) bound_ids: Mutex<Vec<u64>>,
-    pub(crate) required_bindings: Mutex<HashMap<ServiceId, u64>>,
-    pub(crate) dependency_bindings: Mutex<HashMap<ServiceId, u64>>,
-    pub(crate) cleanup_started: Mutex<bool>,
-    pub(crate) sealed: std::sync::atomic::AtomicBool,
+    pub(crate) bindings: Mutex<HashMap<ServiceId, u64>>,
     pub(crate) apply_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl ActivationInner {
     pub(crate) fn seal_services(&self) {
-        let _staged = self.staged.lock();
-        self.sealed.store(true, Ordering::Release);
+        self.services
+            .lock()
+            .expect("activation services lock poisoned")
+            .sealed = true;
     }
+}
+
+pub(crate) struct ActivationServices {
+    pub(crate) staged: HashMap<ServiceId, StagedService>,
+    pub(crate) sealed: bool,
 }
 
 pub(crate) struct StagedService {
@@ -80,19 +81,12 @@ pub struct FiberHandle {
 
 impl FiberHandle {
     pub fn state(&self) -> FiberState {
-        self.inner
-            .state
-            .lock()
-            .map(|state| *state)
-            .unwrap_or(FiberState::Disposed)
+        *self.inner.state_tx.borrow()
     }
 
     pub async fn wait_active(&self) -> Result<(), KernelError> {
         let mut receiver = self.inner.state_tx.subscribe();
         loop {
-            if self.state() == FiberState::Active {
-                return Ok(());
-            }
             match *receiver.borrow() {
                 FiberState::Active => return Ok(()),
                 FiberState::Failed => {
@@ -100,9 +94,10 @@ impl FiberHandle {
                         .inner
                         .life
                         .lock()
-                        .ok()
-                        .and_then(|life| life.error.clone())
-                        .unwrap_or_else(|| "unknown plugin error".into());
+                        .expect("fiber life lock poisoned")
+                        .error
+                        .clone()
+                        .expect("failed fiber must have an error");
                     return Err(KernelError::PluginFailed {
                         name: self.inner.spec.name.clone(),
                         source: Box::new(std::io::Error::other(message)),

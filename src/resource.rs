@@ -22,9 +22,8 @@ pub(crate) struct TaskInner {
 
 impl TaskHandle {
     pub fn abort(&self) {
-        if let Ok(guard) = self.inner.handle.lock()
-            && let Some(handle) = guard.as_ref()
-        {
+        let guard = self.inner.handle.lock().expect("task handle lock poisoned");
+        if let Some(handle) = guard.as_ref() {
             handle.abort();
         }
     }
@@ -33,9 +32,9 @@ impl TaskHandle {
         self.inner
             .handle
             .lock()
-            .ok()
-            .and_then(|guard| guard.as_ref().map(JoinHandle::is_finished))
-            .unwrap_or(true)
+            .expect("task handle lock poisoned")
+            .as_ref()
+            .is_none_or(JoinHandle::is_finished)
     }
 }
 
@@ -69,42 +68,39 @@ impl ResourceOwner {
         &self,
         register: impl FnOnce() -> Result<R, KernelError>,
     ) -> Result<R, KernelError> {
-        let status = self
-            .status
-            .lock()
-            .map_err(|_| KernelError::Internal("resource owner lock poisoned".into()))?;
+        let status = self.status.lock().expect("resource owner lock poisoned");
         if *status != OwnerStatus::Open {
             return Err(KernelError::ScopeClosed);
         }
         register()
     }
 
-    pub(crate) fn push_child_scope(&self, id: u64) -> Result<(), KernelError> {
+    pub(crate) fn push_child_scope(&self, id: u64) {
         self.child_scopes
             .lock()
-            .map_err(|_| KernelError::Internal("resource owner lock poisoned".into()))?
+            .expect("resource owner lock poisoned")
             .push(id);
-        Ok(())
     }
 
-    pub(crate) fn push_child_fiber(&self, id: u64) -> Result<(), KernelError> {
+    pub(crate) fn push_child_fiber(&self, id: u64) {
         self.child_fibers
             .lock()
-            .map_err(|_| KernelError::Internal("resource owner lock poisoned".into()))?
+            .expect("resource owner lock poisoned")
             .push(id);
-        Ok(())
     }
 
     pub(crate) fn remove_child_scope(&self, id: u64) {
-        if let Ok(mut scopes) = self.child_scopes.lock() {
-            scopes.retain(|child| *child != id);
-        }
+        self.child_scopes
+            .lock()
+            .expect("resource owner lock poisoned")
+            .retain(|child| *child != id);
     }
 
     pub(crate) fn remove_child_fiber(&self, id: u64) {
-        if let Ok(mut fibers) = self.child_fibers.lock() {
-            fibers.retain(|fiber| *fiber != id);
-        }
+        self.child_fibers
+            .lock()
+            .expect("resource owner lock poisoned")
+            .retain(|fiber| *fiber != id);
     }
 
     pub(crate) fn spawn<F>(self: &Arc<Self>, id: u64, future: F) -> Result<TaskHandle, KernelError>
@@ -119,23 +115,21 @@ impl ResourceOwner {
         });
         let task_for_future = Arc::clone(&task);
         self.with_open_registration(|| {
-            let mut tasks = self
-                .tasks
-                .lock()
-                .map_err(|_| KernelError::Internal("resource owner lock poisoned".into()))?;
-            let mut handle = task
-                .handle
-                .lock()
-                .map_err(|_| KernelError::Internal("task lock poisoned".into()))?;
+            let mut tasks = self.tasks.lock().expect("resource owner lock poisoned");
+            let mut handle = task.handle.lock().expect("task lock poisoned");
             tasks.insert(id, Arc::clone(&task));
             let join = runtime.spawn(async move {
                 future.await;
-                if let Ok(mut tasks) = owner.tasks.lock() {
-                    tasks.remove(&id);
-                }
-                if let Ok(mut handle) = task_for_future.handle.lock() {
-                    handle.take();
-                }
+                owner
+                    .tasks
+                    .lock()
+                    .expect("resource owner lock poisoned")
+                    .remove(&id);
+                task_for_future
+                    .handle
+                    .lock()
+                    .expect("task lock poisoned")
+                    .take();
             });
             *handle = Some(join);
             drop(handle);
@@ -151,51 +145,51 @@ impl ResourceOwner {
         self.with_open_registration(|| {
             self.cleanups
                 .lock()
-                .map_err(|_| KernelError::Internal("resource owner lock poisoned".into()))?
+                .expect("resource owner lock poisoned")
                 .push(Box::new(move || Box::pin(cleanup())));
             Ok(())
         })
     }
 
     pub(crate) fn take_children(&self) -> (Vec<u64>, Vec<u64>) {
-        let scopes = self
-            .child_scopes
-            .lock()
-            .map(|mut list| std::mem::take(&mut *list))
-            .unwrap_or_default();
-        let fibers = self
-            .child_fibers
-            .lock()
-            .map(|mut list| std::mem::take(&mut *list))
-            .unwrap_or_default();
+        let scopes = {
+            let mut scopes = self
+                .child_scopes
+                .lock()
+                .expect("resource owner lock poisoned");
+            std::mem::take(&mut *scopes)
+        };
+        let fibers = {
+            let mut fibers = self
+                .child_fibers
+                .lock()
+                .expect("resource owner lock poisoned");
+            std::mem::take(&mut *fibers)
+        };
         (scopes, fibers)
     }
 
-    pub(crate) fn begin_close(&self) -> bool {
-        let Ok(mut status) = self.status.lock() else {
-            return false;
-        };
-        if *status != OwnerStatus::Open {
-            return false;
+    pub(crate) fn begin_close(&self) {
+        let mut status = self.status.lock().expect("resource owner lock poisoned");
+        if *status == OwnerStatus::Open {
+            *status = OwnerStatus::Closing;
         }
-        *status = OwnerStatus::Closing;
-        true
     }
 
     pub(crate) async fn close_resources(&self) -> Result<(), KernelError> {
-        let tasks = self
-            .tasks
-            .lock()
-            .map(|mut tasks| std::mem::take(&mut *tasks))
-            .unwrap_or_default();
+        let tasks = {
+            let mut tasks = self.tasks.lock().expect("resource owner lock poisoned");
+            std::mem::take(&mut *tasks)
+        };
         let mut errors = Vec::new();
         for task in tasks.into_values() {
-            if let Ok(guard) = task.handle.lock()
-                && let Some(handle) = guard.as_ref()
-            {
-                handle.abort();
-            }
-            let join = task.handle.lock().ok().and_then(|mut guard| guard.take());
+            let join = {
+                let mut handle = task.handle.lock().expect("task lock poisoned");
+                if let Some(handle) = handle.as_ref() {
+                    handle.abort();
+                }
+                handle.take()
+            };
             if let Some(join) = join
                 && let Err(error) = join.await
                 && !error.is_cancelled()
@@ -204,11 +198,10 @@ impl ResourceOwner {
             }
         }
 
-        let cleanups = self
-            .cleanups
-            .lock()
-            .map(|mut list| std::mem::take(&mut *list))
-            .unwrap_or_default();
+        let cleanups = {
+            let mut cleanups = self.cleanups.lock().expect("resource owner lock poisoned");
+            std::mem::take(&mut *cleanups)
+        };
         for cleanup in cleanups.into_iter().rev() {
             match catch_future(async move { cleanup().await }).await {
                 Ok(Ok(())) => {}
@@ -221,9 +214,30 @@ impl ResourceOwner {
             }
         }
 
-        if let Ok(mut status) = self.status.lock() {
-            *status = OwnerStatus::Closed;
-        }
+        *self.status.lock().expect("resource owner lock poisoned") = OwnerStatus::Closed;
         KernelError::cleanup(errors)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    #[test]
+    fn poisoned_owner_lock_fails_fast() {
+        let owner = ResourceOwner::new();
+        let poisoned = Arc::clone(&owner);
+        assert!(
+            std::thread::spawn(move || {
+                let _status = poisoned.status.lock().unwrap();
+                panic!("poison resource owner status");
+            })
+            .join()
+            .is_err()
+        );
+
+        let result = catch_unwind(AssertUnwindSafe(|| owner.with_open_registration(|| Ok(()))));
+        assert!(result.is_err());
     }
 }

@@ -113,10 +113,17 @@ async fn missing_dependency_then_provider_and_dispose() -> Result<(), KernelErro
     })?;
     tokio::task::yield_now().await;
     assert_eq!(consumer.state(), FiberState::Pending);
+    let consumer_waiter = {
+        let consumer = consumer.clone();
+        tokio::spawn(async move { consumer.wait_active().await })
+    };
+    tokio::task::yield_now().await;
 
     let provider = ctx.mount(ClockPlugin)?;
     provider.wait_active().await?;
-    consumer.wait_active().await?;
+    consumer_waiter
+        .await
+        .map_err(|error| KernelError::Internal(error.to_string()))??;
     assert_eq!(starts.load(Ordering::SeqCst), 1);
 
     provider.dispose().await?;

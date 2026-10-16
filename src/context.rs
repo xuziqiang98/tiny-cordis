@@ -69,14 +69,14 @@ impl Context {
             OwnerId::Activation(_) => {
                 let activation = self.activation.as_ref().ok_or(KernelError::ScopeClosed)?;
                 activation.owner.with_open_registration(|| {
-                    let mut staged = activation
-                        .staged
+                    let mut services = activation
+                        .services
                         .lock()
-                        .map_err(|_| KernelError::Internal("activation lock poisoned".into()))?;
-                    if activation.sealed.load(std::sync::atomic::Ordering::Acquire) {
+                        .expect("activation services lock poisoned");
+                    if services.sealed {
                         return Err(KernelError::ActivationSealed);
                     }
-                    if staged.contains_key(&key.id)
+                    if services.staged.contains_key(&key.id)
                         || self
                             .coordinator
                             .has_local_binding(self.visible_scope, key.id)
@@ -86,7 +86,9 @@ impl Context {
                             name: key.name,
                         });
                     }
-                    staged.insert(key.id, crate::fiber::StagedService { key, value: erased });
+                    services
+                        .staged
+                        .insert(key.id, crate::fiber::StagedService { key, value: erased });
                     Ok(())
                 })
             }
